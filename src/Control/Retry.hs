@@ -37,6 +37,8 @@ module Control.Retry
     , retryPolicy
     , retryPolicyDefault
     , natTransformRetryPolicy
+    , RetryAction (..)
+    , toRetryAction
     , RetryStatus (..)
     , defaultRetryStatus
     , applyPolicy
@@ -50,7 +52,9 @@ module Control.Retry
 
     -- * Applying Retry Policies
     , retrying
+    , retryingDynamic
     , recovering
+    , recoveringDynamic
     , stepping
     , recoverAll
     , skipAsyncExceptions
@@ -191,6 +195,27 @@ instance Monad m => Monoid (RetryPolicyM m) where
 natTransformRetryPolicy :: (forall a. m a -> n a) -> RetryPolicyM m -> RetryPolicyM n
 natTransformRetryPolicy f (RetryPolicyM p) = RetryPolicyM $ \stat -> f (p stat)
 
+-- | Modify the delay of a RetryPolicy.
+-- Does not change whether or not a retry is attempted.
+modifyRetryPolicyDelay :: Functor m => (Int -> Int) -> RetryPolicyM m -> RetryPolicyM m
+modifyRetryPolicyDelay f (RetryPolicyM p) = RetryPolicyM $ \stat -> fmap f <$> p stat
+
+-- | How to handle a failed action.
+data RetryAction
+    = DontRetry
+    -- ^ Don't retry.
+    | ConsultPolicy
+    -- ^ Do what the 'RetryPolicy' says.
+    | ConsultPolicyUseDelay Int
+    -- ^ Retry if the 'RetryPolicy' says so, but override the policy's delay (number of microseconds).
+      deriving (Read, Show, Eq, Generic)
+
+
+-- | Convert a boolean answer to the question "Should we retry?" into
+-- a 'RetryAction'.
+toRetryAction :: Bool -> RetryAction
+toRetryAction False = DontRetry
+toRetryAction True = ConsultPolicy
 
 -------------------------------------------------------------------------------
 -- | Datatype with stats about retries made thus far. The constructor
@@ -245,12 +270,21 @@ applyPolicy
 applyPolicy (RetryPolicyM policy) s = do
     res <- policy s
     case res of
-      Just delay -> return $! Just $! RetryStatus
-          { rsIterNumber = rsIterNumber s + 1
-          , rsCumulativeDelay = rsCumulativeDelay s `boundedPlus` delay
-          , rsPreviousDelay = Just delay }
+      Just delay -> return $! Just $! updateRetryStatus s delay
       Nothing -> return Nothing
 
+
+-- | Add a retry attempt to a 'RetryStatus'.
+updateRetryStatus
+  :: RetryStatus
+  -> Int -- ^ 'rsPreviousDelay'
+  -> RetryStatus
+updateRetryStatus s delay =
+    RetryStatus
+      { rsIterNumber = rsIterNumber s + 1
+      , rsCumulativeDelay = rsCumulativeDelay s `boundedPlus` delay
+      , rsPreviousDelay = Just delay
+      }
 
 -------------------------------------------------------------------------------
 -- | Apply policy and delay by its amount if it results in a retry.
@@ -262,15 +296,21 @@ applyAndDelay
     -> m (Maybe RetryStatus)
 applyAndDelay policy s = do
     chk <- applyPolicy policy s
+    delayByRetryStatus chk
+    return chk
+
+
+delayByRetryStatus
+    :: MonadIO m
+    => Maybe RetryStatus
+    -> m ()
+delayByRetryStatus chk =
     case chk of
       Just rs -> do
         case (rsPreviousDelay rs) of
           Nothing -> return ()
           Just delay -> liftIO $ threadDelay delay
-        return (Just rs)
-      Nothing -> return Nothing
-
-
+      Nothing -> return ()
 
 -------------------------------------------------------------------------------
 -- | Helper for making simplified policies that don't use the monadic
@@ -394,6 +434,60 @@ capDelay limit p = RetryPolicyM $ \ n ->
 
 
 -------------------------------------------------------------------------------
+-- | Same as 'retrying', but with the ability to override
+-- the delay of the retry policy based on information
+-- obtained after initiation.
+--
+-- For example, if the action to run is a HTTP request that
+-- turns out to fail with a status code 429 ("too many requests"),
+-- the response may contain a "Retry-After" HTTP header which
+-- specifies the number of seconds
+-- the client should wait until performing the next request.
+-- This function allows overriding the delay calculated by the given
+-- retry policy with the delay extracted from this header value.
+--
+-- In other words, given an arbitrary 'RetryPolicyM' @rp@, the
+-- following invocation will always delay by 1000 microseconds:
+--
+-- > retryingDynamic rp (\_ _ -> return $ ConsultPolicyUseDelay 1000) f
+--
+-- Note that a 'RetryPolicy's decision to /not/ perform a retry
+-- cannot be overridden. Ie. /when/ to /stop/ retrying is always decided
+-- by the retry policy, regardless of the returned 'RetryAction' value.
+retryingDynamic
+    :: MonadIO m
+    => RetryPolicyM m
+    -> (RetryStatus -> b -> m RetryAction)
+    -- ^ An action to check whether the result should be retried.
+    -- See options in the documentation for 'RetryAction'.
+    -> (RetryStatus -> m b)
+    -- ^ Action to run
+    -> m b
+retryingDynamic policy chk f = go defaultRetryStatus
+  where
+    go s = do
+        res <- f s
+        let consultPolicy rs =
+              case rs of
+                Nothing -> return res
+                Just rs' -> go $! rs'
+        chk' <- chk s res
+        case chk' of
+          DontRetry ->
+            return res
+          ConsultPolicy -> do
+            rs <- applyAndDelay policy s
+            consultPolicy rs
+          ConsultPolicyUseDelay delay -> do
+            -- Apply policy, to see whether we should retry,
+            --  but override its delay.
+            rs <- fmap (const $ updateRetryStatus s delay) <$> applyPolicy policy s
+            -- Delay
+            delayByRetryStatus rs
+            consultPolicy rs
+
+
+-------------------------------------------------------------------------------
 -- | Retry combinator for actions that don't raise exceptions, but
 -- signal in their type the outcome has failed. Examples are the
 -- 'Maybe', 'Either' and 'EitherT' monads.
@@ -422,18 +516,8 @@ retrying  :: MonadIO m
           -> (RetryStatus -> m b)
           -- ^ Action to run
           -> m b
-retrying policy chk f = go defaultRetryStatus
-  where
-    go s = do
-        res <- f s
-        chk' <- chk s res
-        if chk'
-          then do
-            rs <- applyAndDelay policy s
-            case rs of
-              Nothing -> return res
-              Just rs' -> go $! rs'
-          else return res
+retrying policy chk f =
+    retryingDynamic policy (\rs -> fmap toRetryAction . chk rs) f
 
 
 -------------------------------------------------------------------------------
@@ -494,15 +578,9 @@ skipAsyncExceptions = handlers
 
 
 -------------------------------------------------------------------------------
--- | Run an action and recover from a raised exception by potentially
--- retrying the action a number of times. Note that if you're going to
--- use a handler for 'SomeException', you should add explicit cases
--- *earlier* in the list of handlers to reject 'AsyncException' and
--- 'SomeAsyncException', as catching these can cause thread and
--- program hangs. 'recoverAll' already does this for you so if you
--- just plan on catching 'SomeException', you may as well ues
--- 'recoverAll'
-recovering
+-- | The difference between this and 'recovering' is the same as
+--  the difference between 'retryingDynamic' and 'retrying'.
+recoveringDynamic
 #if MIN_VERSION_exceptions(0, 6, 0)
     :: (MonadIO m, MonadMask m)
 #else
@@ -510,15 +588,16 @@ recovering
 #endif
     => RetryPolicyM m
     -- ^ Just use 'retryPolicyDefault' for default settings
-    -> [(RetryStatus -> Handler m Bool)]
+    -> [(RetryStatus -> Handler m RetryAction)]
     -- ^ Should a given exception be retried? Action will be
-    -- retried if this returns True *and* the policy allows it.
+    -- retried if this returns either 'ConsultPolicy' or
+    -- 'ConsultPolicyUseDelay' *and* the policy allows it.
     -- This action will be consulted first even if the policy
     -- later blocks it.
     -> (RetryStatus -> m a)
     -- ^ Action to perform
     -> m a
-recovering policy hs f = mask $ \restore -> go restore defaultRetryStatus
+recoveringDynamic policy hs f = mask $ \restore -> go restore defaultRetryStatus
     where
       go restore = loop
         where
@@ -532,16 +611,51 @@ recovering policy hs f = mask $ \restore -> go restore defaultRetryStatus
               recover e ((($ s) -> Handler h) : hs')
                 | Just e' <- fromException e = do
                     chk <- h e'
+                    let consultPolicy rs = do
+                          case rs of
+                            Just rs' -> loop $! rs'
+                            Nothing -> throwM e'
                     case chk of
-                      True -> do
+                      DontRetry ->
+                        throwM e'
+                      ConsultPolicy -> do
                         rs <- applyAndDelay policy s
-                        case rs of
-                          Just rs' -> loop $! rs'
-                          Nothing -> throwM e'
-                      False -> throwM e'
+                        consultPolicy rs
+                      ConsultPolicyUseDelay delay -> do
+                        -- Apply policy, to see whether we should retry,
+                        --  but override its delay.
+                        rs <- fmap (const $ updateRetryStatus s delay) <$> applyPolicy policy s
+                        -- Delay
+                        delayByRetryStatus rs
+                        consultPolicy rs
                 | otherwise = recover e hs'
 
 
+-------------------------------------------------------------------------------
+-- | Run an action and recover from a raised exception by potentially
+-- retrying the action a number of times. Note that if you're going to
+-- use a handler for 'SomeException', you should add explicit cases
+-- *earlier* in the list of handlers to reject 'AsyncException' and
+-- 'SomeAsyncException', as catching these can cause thread and
+-- program hangs. 'recoverAll' already does this for you so if you
+-- just plan on catching 'SomeException', you may as well ues
+-- 'recoverAll'
+recovering
+    :: (MonadIO m, MonadMask m)
+    => RetryPolicyM m
+    -- ^ Just use 'retryPolicyDefault' for default settings
+    -> [(RetryStatus -> Handler m Bool)]
+    -- ^ Should a given exception be retried? Action will be
+    -- retried if this returns True *and* the policy allows it.
+    -- This action will be consulted first even if the policy
+    -- later blocks it.
+    -> (RetryStatus -> m a)
+    -- ^ Action to perform
+    -> m a
+recovering policy hs f =
+    recoveringDynamic policy hs' f
+  where
+    hs' = map (fmap toRetryAction .) hs
 
 -------------------------------------------------------------------------------
 -- | A version of 'recovering' that tries to run the action only a

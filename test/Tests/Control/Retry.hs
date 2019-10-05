@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE DeriveDataTypeable  #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Tests.Control.Retry
@@ -42,6 +43,7 @@ tests = testGroup "Control.Retry"
   , maskingStateTests
   , capDelayTests
   , limitRetriesByCumulativeDelayTests
+  , overridingDelayTests
   ]
 
 
@@ -192,6 +194,26 @@ retryStatusTests = testGroup "retry status"
       rsIterNumber <$> rses @?= [0, 1, 2]
       rsCumulativeDelay <$> rses @?= [0, 100, 200]
       rsPreviousDelay <$> rses @?= [Nothing, Just 100, Just 100]
+  , testProperty "iteration numbers have the form [0..n-1]" $ property $ do
+      retryPolicy' <- forAll $ genPolicyNoLimit (Range.linear 1 10000)
+      let retryRange = Range.linear 1 10
+      retryCount <- forAll $ Gen.int retryRange
+      retryActions <- forAll $ Gen.list retryRange $ genRetryAction (Range.linear 1 10000)
+      (_, rses) <- runWriterT $ retryingDynamic
+        (retryPolicy' <> limitRetries retryCount)
+        (\rs _ -> return $ retryActions !! rsIterNumber rs)
+        (\rs -> tell [rs])
+      map rsIterNumber rses === [0..length rses-1]
+  , testProperty "cumulative delay is monotonically increasing" $ property $ do
+      retryPolicy' <- forAll $ genPolicyNoLimit (Range.linear 1 10000)
+      let retryRange = Range.linear 1 10
+      retryCount <- forAll $ Gen.int retryRange
+      retryActions <- forAll $ Gen.list retryRange $ genRetryAction (Range.linear 1 10000)
+      (_, rses) <- runWriterT $ retryingDynamic
+        (retryPolicy' <> limitRetries retryCount)
+        (\rs _ -> return $ retryActions !! rsIterNumber rs)
+        (\rs -> tell [rs])
+      HH.assert $ all (>= 0) (compareAdjacent (-) $ map rsCumulativeDelay rses)
   ]
 
 
@@ -312,6 +334,47 @@ quadraticDelayTests = testGroup "quadratic delay"
   ]
 
 -------------------------------------------------------------------------------
+overridingDelayTests :: TestTree
+overridingDelayTests = testGroup "overriding delay"
+  [ testGroup "actual delays don't exceed specified delays"
+    [ testProperty "retryingDynamic" $
+        testOverride
+          retryingDynamic
+          (\delays rs _ -> return $ ConsultPolicyUseDelay (delays !! rsIterNumber rs))
+          (\_ _ -> liftIO getCurrentTime >>= \time -> tell [time])
+    , testProperty "recoveringDynamic" $
+        testOverride
+          recoveringDynamic
+          (\delays -> [\rs -> Handler (\(_::SomeException) -> return $ ConsultPolicyUseDelay (delays !! rsIterNumber rs))])
+          (\delays rs -> do
+              liftIO getCurrentTime >>= \time -> tell [time]
+              if rsIterNumber rs < length delays
+                then throwM (userError "booo")
+                else return ()
+          )
+    ]
+  ]
+  where
+    -- Transform a list of timestamps into a list of differences
+    -- between adjacent timestamps.
+    diffTimes = compareAdjacent (flip diffUTCTime)
+    microsToNominalDiffTime = toNominal . picosecondsToDiffTime . (* 1000000) . fromIntegral
+    toNominal :: DiffTime -> NominalDiffTime
+    toNominal = realToFrac
+    -- Generic test case used to test both "retryingDynamic" and "recoveringDynamic"
+    testOverride retryer handler action = property $ do
+      retryPolicy' <- forAll $ genPolicyNoLimit (Range.linear 1 1000000)
+      delays <- forAll $ Gen.list (Range.linear 1 10) (Gen.int (Range.linear 10 10000))
+      (_, measuredTimestamps) <- liftIO $ runWriterT $ retryer
+        -- Stop retrying when we run out of delays
+        (retryPolicy' <> limitRetries (length delays))
+        (handler delays)
+        (action delays)
+      let expectedDelays = map microsToNominalDiffTime delays
+      forM_ (zip (diffTimes measuredTimestamps) expectedDelays) $
+        \(actual, expected) -> diff actual (>=) expected
+
+-------------------------------------------------------------------------------
 isLeftAnd :: (a -> Bool) -> Either a b -> Bool
 isLeftAnd f ei = case ei of
   Left v -> f v
@@ -320,6 +383,19 @@ isLeftAnd f ei = case ei of
 testHandlers :: [a -> Handler IO Bool]
 testHandlers = [const $ Handler (\(_::SomeException) -> return shouldRetry)]
 
+-- | Apply a function to adjacent list items.
+--
+-- Ie.:
+--    > compareAdjacent f [a0, a1, a2, a3, ..., a(n-2), a(n-1), an] =
+--    >    [f a0 a1, f a1 a2, f a2 a3, ..., f a(n-2) a(n-1), f a(n-1) an]
+--
+-- Not defined for lists of length < 2.
+compareAdjacent :: (a -> a -> b) -> [a] -> [b]
+compareAdjacent f lst =
+    reverse . snd $ foldl
+      (\(a1, accum) a2 -> (a2, f a1 a2 : accum))
+      (head lst, [])
+      (tail lst)
 
 data Custom1 = Custom1 deriving (Eq,Show,Read,Ord,Typeable)
 data Custom2 = Custom2 deriving (Eq,Show,Read,Ord,Typeable)
@@ -341,7 +417,44 @@ genRetryStatus = do
 
 
 -------------------------------------------------------------------------------
+-- |
+genRetryAction
+    :: MonadGen m
+    => Range Int  -- ^ Overridden delay
+    -> m RetryAction
+genRetryAction useDelay = do
+    delay <- Gen.int useDelay
+    Gen.element
+      [ DontRetry
+      , ConsultPolicy
+      , ConsultPolicyUseDelay delay
+      ]
 
+-------------------------------------------------------------------------------
+
+-- Needed to generate a 'RetryPolicyM' using 'forAll'
+instance Show (RetryPolicyM m) where
+    show = const "RetryPolicyM"
+
+-- | Generate an arbitrary 'RetryPolicy' without any limits applied.
+genPolicyNoLimit
+    :: (MonadGen mg, MonadIO mr)
+    => Range Int
+    -> mg (RetryPolicyM mr)
+genPolicyNoLimit durationRange =
+    Gen.choice
+      [ genConstantDelay
+      , genExponentialBackoff
+      , genFullJitterBackoff
+      , genFibonacciBackoff
+      ]
+  where
+    genDuration = Gen.int durationRange
+    -- Retry policies
+    genConstantDelay = fmap constantDelay genDuration
+    genExponentialBackoff = fmap exponentialBackoff genDuration
+    genFullJitterBackoff = fmap fullJitterBackoff genDuration
+    genFibonacciBackoff = fmap fibonacciBackoff genDuration
 
 -------------------------------------------------------------------------------
 -- | Create an action that will fail exactly N times with the given
